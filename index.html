@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Traffic Sign Detection with Distance, Sound, Dark Mode, and Map Markers</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+  :root {
+    --bg-light: #f0f0f0;
+    --bg-dark: #222;
+    --text-light: #222;
+    --text-dark: #eee;
+    --accent-green: #28a745;
+    --accent-red: #dc3545;
+    --accent-yellow: #ffc107;
+  }
+
+  body {
+    font-family: sans-serif;
+    margin: 0; padding: 20px;
+    background: var(--bg-dark);
+    color: var(--text-dark);
+    transition: background 0.3s, color 0.3s;
+  }
+  body.light-mode {
+    background: var(--bg-light);
+    color: var(--text-light);
+  }
+
+  h1 {
+    text-align: center;
+  }
+
+  #videoWrapper {
+    position: relative;
+    width: 100%;
+    max-width: 640px;
+    margin: 0 auto 10px;
+  }
+  video, canvas#overlay {
+    width: 100%;
+    border-radius: 10px;
+    display: block;
+  }
+  canvas#overlay {
+    position: absolute;
+    top: 0; left: 0;
+    pointer-events: none;
+  }
+
+  #output {
+    background: #333;
+    padding: 10px;
+    border-radius: 8px;
+    margin-bottom: 10px;
+    min-height: 40px;
+    text-align: center;
+  }
+  body.light-mode #output {
+    background: #ddd;
+    color: #222;
+  }
+
+  #map {
+    height: 300px;
+    max-width: 640px;
+    margin: 0 auto 20px;
+    border-radius: 10px;
+  }
+
+  .buttons {
+    max-width: 640px;
+    margin: 0 auto 15px;
+    display: flex;
+    justify-content: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+
+  button {
+    padding: 10px 20px;
+    font-size: 1rem;
+    cursor: pointer;
+    border-radius: 6px;
+    border: none;
+    color: white;
+    transition: background 0.3s;
+    flex: 1 1 120px;
+    max-width: 150px;
+  }
+  #startBtn { background: var(--accent-green); }
+  #stopBtn { background: var(--accent-red); }
+  #toggleSoundBtn { background: var(--accent-yellow); color: #222; }
+  #toggleModeBtn { background: #007bff; }
+
+  #logPanel {
+    max-width: 640px;
+    margin: 0 auto;
+    background: #111;
+    color: #eee;
+    padding: 10px;
+    border-radius: 8px;
+    height: 120px;
+    overflow-y: auto;
+    font-family: monospace;
+    font-size: 0.9rem;
+  }
+  body.light-mode #logPanel {
+    background: #eee;
+    color: #222;
+  }
+
+  @media (max-width: 700px) {
+    #map { height: 200px; }
+  }
+</style>
+</head>
+<body>
+
+<h1>Traffic Sign Detection</h1>
+
+<div id="videoWrapper">
+  <video id="video" autoplay muted playsinline></video>
+  <canvas id="overlay"></canvas>
+</div>
+
+<div id="output">Waiting to start detection...</div>
+
+<div class="buttons">
+  <button id="startBtn">Start Detection</button>
+  <button id="stopBtn" disabled>Stop Detection</button>
+  <button id="toggleSoundBtn">Sound: OFF</button>
+  <button id="toggleModeBtn">Dark Mode</button>
+</div>
+
+<div id="logPanel" aria-live="polite" aria-atomic="true">
+  <strong>Detection logs:</strong><br/>
+</div>
+
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+  const video = document.getElementById('video');
+  const overlay = document.getElementById('overlay');
+  const output = document.getElementById('output');
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const toggleSoundBtn = document.getElementById('toggleSoundBtn');
+  const toggleModeBtn = document.getElementById('toggleModeBtn');
+  const logPanel = document.getElementById('logPanel');
+
+  let stream = null;
+  let detectionInterval = null;
+  const ctx = overlay.getContext('2d');
+  const modelEndpoint = 'http://localhost:8000/detect/';  // Change to your backend URL
+
+  let soundEnabled = false;
+
+  // Setup map
+  let map = L.map('map').setView([0, 0], 13);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+  }).addTo(map);
+  let userMarker = null;
+  let accuracyCircle = null;
+  let currentUserLatLng = null;
+
+  // Markers for detected signs
+  let detectedSignMarkers = [];
+
+  // Update user location on map
+  function updateLocation(position) {
+    const { latitude, longitude, accuracy } = position.coords;
+    currentUserLatLng = [latitude, longitude];
+    if (!userMarker) {
+      userMarker = L.marker(currentUserLatLng).addTo(map);
+      accuracyCircle = L.circle(currentUserLatLng, { radius: accuracy }).addTo(map);
+      map.setView(currentUserLatLng, 15);
+    } else {
+      userMarker.setLatLng(currentUserLatLng);
+      accuracyCircle.setLatLng(currentUserLatLng);
+      accuracyCircle.setRadius(accuracy);
+    }
+  }
+
+  navigator.geolocation.watchPosition(updateLocation, err => {
+    console.warn('Geolocation error:', err.message);
+  }, { enableHighAccuracy: true });
+
+  async function startVideo() {
+    if (!stream) {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+        video.srcObject = stream;
+        await video.play();
+        overlay.width = video.videoWidth;
+        overlay.height = video.videoHeight;
+      } catch (err) {
+        alert('Camera access denied or not available.');
+        console.error(err);
+      }
+    }
+  }
+
+  // Simple distance proxy function based on bounding box size
+  // Larger box means closer (we use box height here)
+  function estimateDistance(bbox) {
+    const [x1, y1, x2, y2] = bbox;
+    const boxHeight = y2 - y1;
+    const maxHeight = overlay.height;
+    const minDistance = 2;    // meters, close
+    const maxDistance = 50;   // meters, far
+    const distance = maxDistance - (boxHeight / maxHeight) * (maxDistance - minDistance);
+    return distance.toFixed(1);
+  }
+
+  function speak(text) {
+    if (!soundEnabled || !('speechSynthesis' in window)) return;
+    // Only speak if no speech is currently ongoing (to avoid cut off)
+    if (window.speechSynthesis.speaking) {
+      window.speechSynthesis.cancel();
+    }
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = 1;
+    window.speechSynthesis.speak(utterance);
+  }
+
+  function logDetection(text) {
+    const timestamp = new Date().toLocaleTimeString();
+    logPanel.innerHTML += `[${timestamp}] ${text}<br>`;
+    logPanel.scrollTop = logPanel.scrollHeight;
+  }
+
+  async function detectFrame() {
+    if (!stream) return;
+
+    ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+    // Capture frame
+    let tempCanvas = document.createElement('canvas');
+    tempCanvas.width = video.videoWidth;
+    tempCanvas.height = video.videoHeight;
+    let tempCtx = tempCanvas.getContext('2d');
+    tempCtx.drawImage(video, 0, 0, tempCanvas.width, tempCanvas.height);
+
+    const blob = await new Promise(resolve => tempCanvas.toBlob(resolve, 'image/jpeg', 0.8));
+    const formData = new FormData();
+    formData.append('file', blob, 'frame.jpg');
+
+    try {
+      const res = await fetch(modelEndpoint, { method: 'POST', body: formData });
+      if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+      const data = await res.json();
+
+      if (data.detections && data.detections.length > 0) {
+        const warnings = data.warnings.join(', ') || 'Signs detected!';
+        output.textContent = warnings;
+
+        // Play warning sounds for each unique warning, but avoid cut off
+        if (soundEnabled) {
+          data.warnings.forEach(warning => speak(warning));
+        }
+
+        // Draw boxes and calculate distances
+        data.detections.forEach(det => {
+          const [x1, y1, x2, y2] = det.bbox;
+          const dist = estimateDistance(det.bbox);
+
+          ctx.strokeStyle = '#00FF00';
+          ctx.lineWidth = 3;
+          ctx.font = '20px Arial';
+          ctx.fillStyle = '#00FF00';
+
+          ctx.beginPath();
+          ctx.rect(x1, y1, x2 - x1, y2 - y1);
+          ctx.stroke();
+
+          const label = `${det.class_name} (${dist} cm)`; // Display distance + cm unit as requested
+          ctx.fillText(label, x1 + 5, y1 + 25);
+
+          // Log detection with distance
+          logDetection(label);
+
+          // Add marker on map at current user location for each detected sign
+          if (currentUserLatLng) {
+            const marker = L.marker(currentUserLatLng, {
+              title: det.class_name,
+              icon: L.icon({
+                iconUrl: 'https://cdn-icons-png.flaticon.com/512/565/565547.png', // traffic sign icon example
+                iconSize: [32, 32],
+                iconAnchor: [16, 32],
+              })
+            }).addTo(map);
+            marker.bindPopup(`${det.class_name} detected here`).openPopup();
+            detectedSignMarkers.push(marker);
+          }
+        });
+      } else {
+        output.textContent = 'No signs detected.';
+        logDetection('No signs detected.');
+      }
+    } catch (error) {
+      output.textContent = 'Error detecting signs.';
+      console.error(error);
+    }
+  }
+
+  startBtn.onclick = async () => {
+    await startVideo();
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+    output.textContent = 'Detecting signs...';
+    logPanel.innerHTML += `<br><em>Started detection at ${new Date().toLocaleTimeString()}</em><br>`;
+    detectionInterval = setInterval(detectFrame, 1500);
+  };
+
+  stopBtn.onclick = () => {
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    output.textContent = 'Detection stopped.';
+    logPanel.innerHTML += `<br><em>Stopped detection at ${new Date().toLocaleTimeString()}</em><br>`;
+    clearInterval(detectionInterval);
+    detectionInterval = null;
+
+    ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+    if (stream) {
+      stream.getTracks().forEach(track => track.stop());
+      stream = null;
+      video.srcObject = null;
+    }
+
+    // Optional: Clear all detected sign markers when detection stops
+    detectedSignMarkers.forEach(marker => map.removeLayer(marker));
+    detectedSignMarkers = [];
+  };
+
+  toggleSoundBtn.onclick = () => {
+    soundEnabled = !soundEnabled;
+    toggleSoundBtn.textContent = `Sound: ${soundEnabled ? 'ON' : 'OFF'}`;
+  };
+
+  toggleModeBtn.onclick = () => {
+    document.body.classList.toggle('light-mode');
+    const isLight = document.body.classList.contains('light-mode');
+    toggleModeBtn.textContent = isLight ? 'Dark Mode' : 'Light Mode';
+  };
+</script>
+
+</body>
+</html>
